@@ -14,6 +14,12 @@ type Request struct {
 	Priority int
 }
 
+// ErrDeferred is returned (wrapping the coordinator's CapacityError) when the
+// head request could not be granted because healthy capacity is insufficient.
+// The request remains queued at the front and can be retried with Next once
+// pump health frees capacity; it is never discarded or over-allocated.
+var ErrDeferred = errors.New("reflux request deferred: capacity unavailable")
+
 type Allocator struct {
 	mu          sync.Mutex
 	coordinator *Coordinator
@@ -35,6 +41,9 @@ func (a *Allocator) Submit(request Request) error {
 	return nil
 }
 
+// Next grants the highest-priority pending request. If healthy capacity cannot
+// cover it, the request is put back at the head of the queue and an error
+// joining ErrDeferred with the detailed CapacityError is returned.
 func (a *Allocator) Next() (model.Lease, error) {
 	a.mu.Lock()
 	if len(a.queue) == 0 {
@@ -44,7 +53,15 @@ func (a *Allocator) Next() (model.Lease, error) {
 	request := a.queue[0]
 	a.queue = a.queue[1:]
 	a.mu.Unlock()
-	return a.coordinator.Acquire(request.Owner, request.Capacity, request.Fence)
+
+	lease, err := a.coordinator.Acquire(request.Owner, request.Capacity, request.Fence)
+	if err != nil {
+		a.mu.Lock()
+		a.queue = append([]Request{request}, a.queue...)
+		a.mu.Unlock()
+		return model.Lease{}, errors.Join(ErrDeferred, err)
+	}
+	return lease, nil
 }
 
 func (a *Allocator) Pending() []Request {
