@@ -9,6 +9,7 @@ import (
 
 type Request struct {
 	Owner    string
+	Pump     string
 	Capacity float64
 	Fence    uint64
 	Priority int
@@ -44,7 +45,7 @@ func (a *Allocator) Next() (model.Lease, error) {
 	request := a.queue[0]
 	a.queue = a.queue[1:]
 	a.mu.Unlock()
-	return a.coordinator.Acquire(request.Owner, request.Capacity, request.Fence)
+	return a.coordinator.AcquireOn(request.Pump, request.Owner, request.Capacity, request.Fence)
 }
 
 func (a *Allocator) Pending() []Request {

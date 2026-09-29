@@ -20,7 +20,18 @@ type routeRequest struct {
 }
 type leaseRequest struct {
 	Owner  string  `json:"owner"`
+	Pump   string  `json:"pump"`
 	Amount float64 `json:"amount"`
+}
+type pumpHealthRequest struct {
+	Pump        string   `json:"pump"`
+	At          int64    `json:"at"`
+	Vibration   *float64 `json:"vibration"`
+	Temperature *float64 `json:"temperature"`
+}
+type releaseLeaseRequest struct {
+	Owner string `json:"owner"`
+	Pump  string `json:"pump"`
 }
 
 func decodeJSON(r *http.Request, value any) error {

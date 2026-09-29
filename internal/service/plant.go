@@ -208,8 +208,17 @@ func (p *Plant) RouteProduct(target string) error {
 }
 
 func (p *Plant) AcquireReflux(owner string, amount float64) (model.Lease, error) {
+	return p.AcquireRefluxOn(reflux.DefaultPump, owner, amount)
+}
+
+// AcquireRefluxOn submits a new lease application for a specific pump. New applications
+// are checked against the pump's health-limited capacity and rejected rather than overcommitting.
+func (p *Plant) AcquireRefluxOn(pump, owner string, amount float64) (model.Lease, error) {
+	if pump == "" {
+		pump = reflux.DefaultPump
+	}
 	current := p.Campaign.Snapshot()
-	lease, err := p.Reflux.Acquire(owner, amount, current.Fencing)
+	lease, err := p.Reflux.AcquireOn(pump, owner, amount, current.Fencing)
 	if err != nil {
 		p.Incidents.Open("reflux-capacity", err.Error(), current.Revision.String())
 		return model.Lease{}, err
@@ -217,11 +226,85 @@ func (p *Plant) AcquireReflux(owner string, amount float64) (model.Lease, error)
 	p.Leases.Put(lease)
 	p.UtilityLedger.Commit(lease)
 	p.RefluxTelemetry.Record(p.RefluxState.Snapshot())
-	if err := p.record("reflux.lease", owner); err != nil {
-		p.Reflux.Release(lease)
+	if err := p.record("reflux.lease", pump+":"+owner); err != nil {
+		p.Reflux.ReleaseOn(pump, lease)
 		return model.Lease{}, err
 	}
 	return lease, nil
+}
+
+// PumpHealthReading is a vibration/temperature point for one reflux pump.
+type PumpHealthReading struct {
+	Pump        string
+	At          time.Time
+	Vibration   *float64
+	Temperature *float64
+}
+
+// ObservePumpHealth ingests vibration and/or bearing temperature points, re-derives
+// the usable capacity of the pump, and reconciles leases granted before the degradation.
+// Existing leases are never silently resized or evicted: each one that now exceeds the
+// health-limited capacity raises an incident and is returned for explicit fencing or release.
+func (p *Plant) ObservePumpHealth(reading PumpHealthReading) ([]reflux.Overcommit, error) {
+	if reading.Pump == "" {
+		return nil, errors.New("pump health reading missing pump id")
+	}
+	if reading.At.IsZero() {
+		reading.At = time.Now()
+	}
+	monitor := p.Reflux.Health()
+	// One time-stamped health point counts as a single observation toward recovery
+	// confirmation, even when it carries both channels.
+	if err := monitor.Record(reading.Pump, reading.At,
+		derefFloat(reading.Vibration), derefFloat(reading.Temperature),
+		reading.Vibration != nil, reading.Temperature != nil); err != nil {
+		return nil, err
+	}
+	current := p.Campaign.Snapshot()
+	overcommitted := p.Reflux.ReconcileLeases()
+	for _, over := range overcommitted {
+		message := fmt.Sprintf("%s: lease %s granted %.3f exceeds available %.3f (%v)",
+			over.Pump, over.Lease.Owner, over.Granted, over.Available, over.Reasons)
+		p.Incidents.Open("reflux-health", message, current.Revision.String())
+	}
+	reasons := monitor.Health(reading.Pump).Reasons
+	payload := fmt.Sprintf("%s:%.3f:%.3f:%t:%v", reading.Pump, derefFloat(reading.Vibration), derefFloat(reading.Temperature), len(overcommitted) > 0, reasons)
+	if err := p.record("reflux.health", payload); err != nil {
+		p.fail(err)
+		return overcommitted, err
+	}
+	return overcommitted, nil
+}
+
+func derefFloat(value *float64) float64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+// ReleaseRefluxLease explicitly releases an old lease that exceeds the pump's current
+// health-limited capacity. Degraded pumps never evict leases silently; operators must
+// choose to release, after which the freed capacity can serve new (smaller) requests.
+func (p *Plant) ReleaseRefluxLease(pump, owner string) error {
+	if pump == "" {
+		pump = reflux.DefaultPump
+	}
+	lease, ok := p.Reflux.LeaseOn(pump, owner)
+	if !ok {
+		return fmt.Errorf("no active reflux lease for %s on pump %s", owner, pump)
+	}
+	p.Reflux.ReleaseOn(pump, lease)
+	p.UtilityLedger.Revoke(owner, lease.Fence)
+	return p.record("reflux.lease.released", pump+":"+owner)
+}
+
+// PumpHealth returns the full health report for one pump.
+func (p *Plant) PumpHealth(pump string) map[string]any {
+	if pump == "" {
+		pump = reflux.DefaultPump
+	}
+	return p.Reflux.PumpHealth(pump)
 }
 
 func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.ShutdownResult, error) {
@@ -284,7 +367,7 @@ func (p *Plant) Status() map[string]any {
 	lastError := p.lastError
 	p.mu.RUnlock()
 	gradient, _ := p.Profile.Gradient()
-	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
+	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "reflux_pump_health": p.Reflux.PumpHealthAll(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
 }
 
 func (p *Plant) record(kind, payload string) error {
